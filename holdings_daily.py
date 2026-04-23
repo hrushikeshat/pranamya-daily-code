@@ -10,6 +10,8 @@ import io
 import json
 import re
 import tempfile
+import time
+import socket
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -18,6 +20,7 @@ import numpy as np
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 import gspread
 from gspread_dataframe import set_with_dataframe
 
@@ -42,14 +45,45 @@ print(f"Working directory: {WORK}")
 def _escape_q(s):
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
+def _retry(fn, *args, **kwargs):
+    """Call fn(*args, **kwargs) retrying on transient errors (5xx, socket)."""
+    delays = [0.5, 1, 2, 4, 8]
+    last_exc = None
+    for i, d in enumerate(delays + [None]):
+        try:
+            return fn(*args, **kwargs)
+        except HttpError as e:
+            status = getattr(e, "resp", None)
+            code = getattr(status, "status", None)
+            try:
+                code = int(code) if code is not None else None
+            except (TypeError, ValueError):
+                code = None
+            if code is not None and 500 <= code < 600:
+                last_exc = e
+                if d is None:
+                    break
+                print(f"  transient HttpError {code}; retrying in {d}s (attempt {i+1}/{len(delays)})")
+                time.sleep(d)
+                continue
+            raise
+        except (socket.error, TimeoutError, ConnectionError) as e:
+            last_exc = e
+            if d is None:
+                break
+            print(f"  transient network error {type(e).__name__}; retrying in {d}s (attempt {i+1}/{len(delays)})")
+            time.sleep(d)
+            continue
+    raise last_exc
+
 def find_folder_id(name, parent_id=None):
     q = f"mimeType='application/vnd.google-apps.folder' and name='{_escape_q(name)}' and trashed=false"
     if parent_id:
         q += f" and '{parent_id}' in parents"
-    res = drive_svc.files().list(
+    res = _retry(drive_svc.files().list(
         q=q, fields="files(id,name)",
         supportsAllDrives=True, includeItemsFromAllDrives=True,
-    ).execute()
+    ).execute)
     files = res.get("files", [])
     return files[0]["id"] if files else None
 
@@ -66,10 +100,10 @@ def resolve_path(path_parts):
 
 def find_file_id(name, parent_id):
     q = f"name='{_escape_q(name)}' and '{parent_id}' in parents and trashed=false"
-    res = drive_svc.files().list(
+    res = _retry(drive_svc.files().list(
         q=q, fields="files(id,name)",
         supportsAllDrives=True, includeItemsFromAllDrives=True,
-    ).execute()
+    ).execute)
     files = res.get("files", [])
     return files[0]["id"] if files else None
 
@@ -79,7 +113,7 @@ def download_file(file_id, local_path):
         downloader = MediaIoBaseDownload(f, req)
         done = False
         while not done:
-            _, done = downloader.next_chunk()
+            _, done = _retry(downloader.next_chunk)
     return local_path
 
 def upload_file(local_path, parent_folder_id, drive_name=None, mime=None):
@@ -87,15 +121,15 @@ def upload_file(local_path, parent_folder_id, drive_name=None, mime=None):
     existing = find_file_id(drive_name, parent_folder_id)
     media = MediaFileUpload(local_path, mimetype=mime, resumable=False)
     if existing:
-        drive_svc.files().update(
+        _retry(drive_svc.files().update(
             fileId=existing, media_body=media, supportsAllDrives=True
-        ).execute()
+        ).execute)
         print(f"Updated on Drive: {drive_name}")
     else:
-        drive_svc.files().create(
+        _retry(drive_svc.files().create(
             body={"name": drive_name, "parents": [parent_folder_id]},
             media_body=media, supportsAllDrives=True,
-        ).execute()
+        ).execute)
         print(f"Created on Drive: {drive_name}")
 
 def dl_by_path(path_parts, filename):
